@@ -1,5 +1,7 @@
 use errno::{errno, set_errno};
+use nix::errno::Errno;
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::{libc, unistd::Pid};
 
 // You may assume that these constants are large enough.
@@ -106,8 +108,43 @@ impl Shell {
         // TODO: Implementation for evaluating a command line
     }
 
-    fn parseline(&self) -> () {
-        // TODO: Implementation for parsing command line
+    pub fn parseline(&self, cmdline: &str) -> (Vec<String>, bool) {
+        let mut argv = Vec::new();
+
+        let mut trimmed = cmdline.trim();
+
+        if trimmed.is_empty() {
+            return (argv, true);
+        }
+
+        while !trimmed.is_empty() {
+            // Handle quoted arguments
+            if trimmed.starts_with('\'') {
+                let end = trimmed[1..].find('\'').unwrap_or(trimmed.len() - 1);
+                argv.push(trimmed[1..1 + end].to_string());
+                trimmed = &trimmed[1 + end + 1..];
+            }
+            // Handle unquoted arguments
+            else {
+                let end = trimmed.find(' ').unwrap_or(trimmed.len());
+                argv.push(trimmed[..end].to_string());
+                trimmed = &trimmed[end..];
+            }
+
+            // Skip whitespace
+            trimmed = trimmed.trim_start();
+        }
+
+        let mut bg = false;
+
+        if let Some(last) = argv.last() {
+            if last == "&" {
+                argv.pop();
+                bg = true;
+            }
+        }
+
+        (argv, bg)
     }
 
     fn do_bgfg(&self, argv: &[String]) -> () {
@@ -156,12 +193,12 @@ impl Shell {
         0
     }
 
-    fn getjobpid(&self, pid: Pid) -> Option<&Job> {
+    fn getjobpid(&mut self, pid: Pid) -> Option<&mut Job> {
         if pid.as_raw() < 1 {
             return None;
         }
 
-        for job in &self.jobs {
+        for job in &mut self.jobs {
             if let Some(job_pid) = job.pid {
                 if job_pid == pid {
                     return Some(job);
@@ -258,8 +295,41 @@ impl Shell {
         std::process::exit(1);
     }
 
-    pub fn sigchld_handler(&self) -> () {
-        // TODO: Implementation for handling SIGCHLD signal
+    pub fn sigchld_handler(&mut self) -> () {
+        let olderrrno = errno();
+
+        loop {
+            match waitpid(
+                Pid::from_raw(-1),
+                Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
+            ) {
+                Ok(WaitStatus::Exited(pid, _)) if self.getjobpid(pid).is_some() => {
+                    self.deletejob(pid);
+                }
+                Ok(WaitStatus::Signaled(pid, _, _)) if let Some(job) = self.getjobpid(pid) => {
+                    sio_puts(&format!(
+                        "Job [{}] ({}) terminated by signal SIGINT\n",
+                        job.jid, pid
+                    ));
+                    self.deletejob(pid);
+                }
+                Ok(WaitStatus::Stopped(pid, _)) if let Some(job) = self.getjobpid(pid) => {
+                    job.state = JobState::ST;
+                    sio_puts(&format!(
+                        "Job [{}] ({}) stopped by signal SIGTSTP\n",
+                        job.jid, pid
+                    ));
+                }
+                Ok(_) => break,
+                Err(Errno::ECHILD) => break,
+                Err(_) => {
+                    sio_puts("waitpid error");
+                    break;
+                }
+            }
+        }
+
+        set_errno(olderrrno);
     }
 }
 
