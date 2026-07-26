@@ -320,8 +320,8 @@ impl Shell {
                         job.jid, pid
                     ));
                 }
-                Ok(_) => break,
-                Err(Errno::ECHILD) => break,
+                Ok(_) => break, // No changes in child processes
+                Err(Errno::ECHILD) => break, // No more child processes
                 Err(_) => {
                     sio_puts("waitpid error");
                     break;
