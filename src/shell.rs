@@ -1,8 +1,14 @@
+use std::env;
+
 use errno::{errno, set_errno};
 use nix::errno::Errno;
+use nix::libc;
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, sigaction};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, kill, pthread_sigmask};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::{libc, unistd::Pid};
+use nix::unistd::{ForkResult, Pid, execve, fork, setpgid};
+use signal_hook::consts::{SIGCHLD, SIGINT, SIGQUIT, SIGTSTP};
+use signal_hook::iterator::Signals;
 
 // You may assume that these constants are large enough.
 const MAXLINE: usize = 1024; // max line size
@@ -72,7 +78,7 @@ impl Shell {
         pathvec
     }
 
-    pub fn builtin_cmd(&self, argv: &[String]) -> bool {
+    pub fn builtin_cmd(&mut self, argv: &[String], signals: &mut Signals) -> bool {
         match argv[0].as_str() {
             "quit" => {
                 std::process::exit(0);
@@ -82,7 +88,7 @@ impl Shell {
                 true
             }
             "bg" | "fg" => {
-                self.do_bgfg(argv);
+                self.do_bgfg(argv, signals);
                 true
             }
             _ => false,
@@ -99,13 +105,115 @@ impl Shell {
                     JobState::UNDEF => "listjobs: Internal error",
                 };
 
-                println!("[{}] ({}) {} {}", job.jid, pid, state_str, job.cmdline);
+                print!("[{}] ({}) {} {}", job.jid, pid, state_str, job.cmdline);
             }
         }
     }
 
-    fn eval(&self) {
-        // TODO: Implementation for evaluating a command line
+    pub fn eval(&mut self, cmdline: &str, pathvec: &[String], signals: &mut Signals) {
+        let (argv, isbg) = self.parseline(cmdline);
+
+        if argv.is_empty() {
+            return;
+        }
+
+        let mut mask = SigSet::empty();
+        let mut prev = SigSet::empty();
+
+        mask.add(Signal::SIGCHLD);
+
+        if !self.builtin_cmd(&argv, signals) {
+            if let Err(e) = pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), Some(&mut prev)) {
+                unix_error(&format!("pthread_sigmask error: {}", e));
+            }
+
+            match unsafe { fork() } {
+                Ok(ForkResult::Parent { child, .. }) => {
+                    if let Err(e) = setpgid(child, child) {
+                        unix_error(&format!("setpgid error: {}", e));
+                    }
+                    let state = if isbg { JobState::BG } else { JobState::FG };
+                    self.addjob(child, state, cmdline);
+
+                    if isbg {
+                        println!("[{}] ({}) {}", self.pid2jid(child), child, cmdline.trim());
+                    }
+
+                    if let Err(e) = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&prev), None) {
+                        unix_error(&format!("pthread_sigmask error: {}", e));
+                    }
+
+                    if !isbg {
+                        self.waitfg(child, signals);
+                    }
+                }
+                Ok(ForkResult::Child) => {
+                    let dfl = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+                    for sig in [
+                        Signal::SIGINT,
+                        Signal::SIGTSTP,
+                        Signal::SIGQUIT,
+                        Signal::SIGCHLD,
+                    ] {
+                        unsafe {
+                            let _ = sigaction(sig, &dfl);
+                        }
+                    }
+
+                    if let Err(e) = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&prev), None) {
+                        unix_error(&format!("pthread_sigmask error: {}", e));
+                    }
+                    if let Err(e) = setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
+                        unix_error(&format!("setpgid error: {}", e));
+                    }
+
+                    let args = argv
+                        .iter()
+                        .map(|arg| {
+                            std::ffi::CString::new(arg.as_str())
+                                .expect("Should be able to create a CString from argument")
+                        })
+                        .collect::<Vec<_>>();
+                    let env = env::vars()
+                        .map(|(key, value)| {
+                            std::ffi::CString::new(format!("{}={}", key, value)).expect(
+                                "Should be able to create a CString from environment variable",
+                            )
+                        })
+                        .collect::<Vec<_>>();
+
+                    if !argv[0].contains('/') && pathvec.len() > 0 {
+                        for path in pathvec {
+                            let full_path: String;
+
+                            if path.is_empty() {
+                                full_path = format!("./{}", argv[0]);
+                            } else {
+                                full_path = format!("{}/{}", path, argv[0]);
+                            }
+
+                            let cmd = std::ffi::CString::new(full_path.as_str())
+                                .expect("Should be able to create a CString from full path");
+
+                            let _ = execve(&cmd, &args, &env);
+                        }
+                    } else {
+                        let cmd = std::ffi::CString::new(argv[0].as_str())
+                            .expect("Should be able to create a CString from first argument");
+
+                        let _ = execve(&cmd, &args, &env);
+                        println!("{}: Command not found", argv[0]);
+                        std::process::exit(0);
+                    }
+
+                    println!("{}: Command not found", argv[0]);
+                    std::process::exit(0);
+                }
+                Err(_) => {
+                    unix_error("fork error");
+                }
+            }
+        }
     }
 
     pub fn parseline(&self, cmdline: &str) -> (Vec<String>, bool) {
@@ -114,7 +222,7 @@ impl Shell {
         let mut trimmed = cmdline.trim();
 
         if trimmed.is_empty() {
-            return (argv, true);
+            return (argv, false);
         }
 
         while !trimmed.is_empty() {
@@ -147,26 +255,103 @@ impl Shell {
         (argv, bg)
     }
 
-    fn do_bgfg(&self, argv: &[String]) -> () {
-        // TODO: Implementation for bg and fg commands
+    fn do_bgfg(&mut self, argv: &[String], signals: &mut Signals) -> () {
+        if argv.len() < 2 {
+            println!("{} command requires PID or %jobid argument", argv[0]);
+            return;
+        }
+
+        if argv[1].starts_with('%') && argv[1][1..].parse::<usize>().is_ok() {
+            let jid = argv[1][1..]
+                .parse::<usize>()
+                .expect("There should be a JID for this job!");
+            let job = self.getjobjid(jid);
+            let job = match job {
+                Some(job) => job,
+                None => {
+                    println!("{}: No such job", argv[1]);
+                    return;
+                }
+            };
+
+            if argv[0] == "bg" {
+                if let Err(e) = kill(
+                    Pid::from_raw(
+                        -(job
+                            .pid
+                            .expect("There should be a PID for this job!")
+                            .as_raw()),
+                    ),
+                    Signal::SIGCONT,
+                ) {
+                    sio_puts(&format!("kill error: {}\n", e));
+                }
+                job.state = JobState::BG;
+                print!(
+                    "[{}] ({}) {}",
+                    job.jid,
+                    job.pid.expect("There should be a PID for this job"),
+                    job.cmdline
+                );
+            } else {
+                if let Err(e) = kill(
+                    Pid::from_raw(
+                        -(job
+                            .pid
+                            .expect("There should be a PID for this job!")
+                            .as_raw()),
+                    ),
+                    Signal::SIGCONT,
+                ) {
+                    sio_puts(&format!("kill error: {}\n", e));
+                }
+                job.state = JobState::FG;
+                let pid = job.pid.expect("There should be a PID for this job!");
+                self.waitfg(pid, signals);
+            }
+        } else if argv[1].chars().all(|c| c.is_ascii_digit()) {
+            let pid = Pid::from_raw(argv[1].parse::<i32>().unwrap());
+            let job = self.getjobpid(pid);
+            let job = match job {
+                Some(job) => job,
+                None => {
+                    println!("({}): No such process", pid);
+                    return;
+                }
+            };
+
+            if argv[0] == "bg" {
+                if let Err(e) = kill(Pid::from_raw(-pid.as_raw()), Signal::SIGCONT) {
+                    sio_puts(&format!("kill error: {}\n", e));
+                }
+                job.state = JobState::BG;
+                print!("[{}] ({}) {}", job.jid, pid, job.cmdline);
+            } else {
+                if let Err(e) = kill(Pid::from_raw(-pid.as_raw()), Signal::SIGCONT) {
+                    sio_puts(&format!("kill error: {}\n", e));
+                }
+                job.state = JobState::FG;
+                self.waitfg(pid, signals);
+            }
+        } else {
+            print!("{}: argument must be a PID or %jobid\n", argv[0]);
+        }
     }
 
-    fn waitfg(&self, pid: Pid) {
-        let mut mask = SigSet::empty();
-        let mut prev = SigSet::empty();
-
-        mask.add(Signal::SIGCHLD);
-
-        if let Err(e) = pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), Some(&mut prev)) {
-            unix_error(&format!("pthread_sigmask error: {}", e));
-        }
-
+    fn waitfg(&mut self, pid: Pid, signals: &mut Signals) {
         while self.fgpid() == Some(pid) {
-            let _ = prev.suspend();
-        }
-
-        if let Err(e) = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&prev), None) {
-            unix_error(&format!("pthread_sigmask error: {}", e));
+            for signal in signals.wait() {
+                match signal {
+                    SIGCHLD => self.sigchld_handler(),
+                    SIGINT => self.sigint_handler(),
+                    SIGTSTP => self.sigtstp_handler(),
+                    SIGQUIT => self.sigquit_handler(),
+                    _ => {}
+                }
+                if self.fgpid() != Some(pid) {
+                    return;
+                }
+            }
         }
     }
 
@@ -208,12 +393,12 @@ impl Shell {
         None
     }
 
-    fn getjobjid(&self, jid: usize) -> Option<&Job> {
+    fn getjobjid(&mut self, jid: usize) -> Option<&mut Job> {
         if jid < 1 {
             return None;
         }
 
-        for job in &self.jobs {
+        for job in &mut self.jobs {
             if job.jid == jid {
                 return Some(job);
             }
@@ -256,13 +441,14 @@ impl Shell {
         for job in &mut self.jobs {
             if let Some(job_pid) = job.pid {
                 if job_pid == pid {
+                    if self.verbose_flag {
+                        println!("Deleted job [{}] {}", job.jid, pid);
+                    }
                     job.pid = None;
                     job.jid = 0;
                     job.state = JobState::UNDEF;
                     job.cmdline.clear();
-                    if self.verbose_flag {
-                        println!("Deleted job [{}] {}", job.jid, pid);
-                    }
+                    self.next_jid = self.maxjid() + 1;
                     return true;
                 }
             }
@@ -320,7 +506,7 @@ impl Shell {
                         job.jid, pid
                     ));
                 }
-                Ok(_) => break, // No changes in child processes
+                Ok(_) => break,              // No changes in child processes
                 Err(Errno::ECHILD) => break, // No more child processes
                 Err(_) => {
                     sio_puts("waitpid error");
@@ -330,6 +516,16 @@ impl Shell {
         }
 
         set_errno(olderrrno);
+    }
+
+    fn maxjid(&self) -> usize {
+        let mut max = 0;
+        for job in &self.jobs {
+            if job.jid > max {
+                max = job.jid;
+            }
+        }
+        max
     }
 }
 
